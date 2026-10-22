@@ -4,7 +4,6 @@ from time import perf_counter
 
 from database import patent_count, search_patents
 
-
 st.set_page_config(page_title="Patent Search", page_icon="🔎")
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 
@@ -49,6 +48,11 @@ title_keyword = st.sidebar.text_input("Title contains")
 abstract_keyword = st.sidebar.text_input("Abstract contains")
 exact_title = st.sidebar.text_input("Exact title")
 hybrid_enabled = st.sidebar.checkbox("Enable hybrid filters", value=True)
+rerank_enabled = st.sidebar.checkbox(
+	"Use cross-encoder reranking",
+	value=False,
+	help="Scores the top 100 candidates more deeply, but takes longer on CPU.",
+)
 
 query = st.text_input("Search patents", placeholder="Try: vehicle wheel sensor")
 has_filter_input = any(
@@ -68,6 +72,7 @@ if query.strip() or has_filter_input:
 		abstract_keyword,
 		exact_title,
 		hybrid_enabled,
+		rerank_enabled,
 	)
 	if st.session_state.get("last_search") != search_key:
 		st.session_state.last_search = search_key
@@ -82,7 +87,9 @@ if query.strip() or has_filter_input:
 		"exact_title": exact_title,
 	}
 	baseline_start = perf_counter()
-	search_patents(query, limit=page_size + 1, offset=0, hybrid=False)
+	search_patents(
+		query, limit=page_size + 1, offset=0, hybrid=False, rerank=False
+	)
 	baseline_ms = (perf_counter() - baseline_start) * 1000
 
 	hybrid_start = perf_counter()
@@ -91,6 +98,8 @@ if query.strip() or has_filter_input:
 		limit=page_size + 1,
 		offset=page * page_size,
 		hybrid=hybrid_enabled,
+		candidate_limit=100,
+		rerank=rerank_enabled,
 		**filters,
 	)
 	hybrid_ms = (perf_counter() - hybrid_start) * 1000
@@ -99,8 +108,8 @@ if query.strip() or has_filter_input:
 
 	st.subheader(f"Results (page {page + 1})")
 	st.caption(
-		f"Search time: {hybrid_ms:.2f} ms with hybrid mode | "
-		f"{baseline_ms:.2f} ms without filters"
+		f"Search time: {hybrid_ms:.2f} ms ({'cross-encoder' if rerank_enabled else 'BM25'}) | "
+		f"{baseline_ms:.2f} ms baseline"
 	)
 	if not results:
 		st.info("No matching patents found.")

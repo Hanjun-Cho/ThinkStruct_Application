@@ -1,12 +1,19 @@
 import json
 import re
 import sqlite3
+from functools import lru_cache
 from pathlib import Path
 
 
 DATABASE_PATH = Path(__file__).parent / "patents.db"
 DATA_DIRECTORY = Path(__file__).parent / "data"
+CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
+@lru_cache(maxsize=1)
+def _cross_encoder():
+    from sentence_transformers import CrossEncoder
+
+    return CrossEncoder(CROSS_ENCODER_MODEL, max_length=128)
 
 def _as_text(value: object) -> str:
     if isinstance(value, str):
@@ -14,7 +21,6 @@ def _as_text(value: object) -> str:
     if value is None:
         return ""
     return json.dumps(value, ensure_ascii=False)
-
 
 def _read_patents() -> list[dict]:
     patents = []
@@ -35,7 +41,6 @@ def _read_patents() -> list[dict]:
                 }
             )
     return patents
-
 
 def build_database() -> None:
     patents = _read_patents()
@@ -92,7 +97,6 @@ def build_database() -> None:
             "INSERT INTO patent_search(patent_search) VALUES ('rebuild')"
         )
 
-
 def ensure_database() -> None:
     if not DATABASE_PATH.exists():
         build_database()
@@ -106,12 +110,10 @@ def ensure_database() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_patents_title ON patents(title)"
             )
 
-
 def patent_count() -> int:
     ensure_database()
     with sqlite3.connect(DATABASE_PATH) as connection:
         return connection.execute("SELECT COUNT(*) FROM patents").fetchone()[0]
-
 
 def search_patents(
     query: str,
@@ -122,6 +124,8 @@ def search_patents(
     abstract_keyword: str = "",
     exact_title: str = "",
     hybrid: bool = True,
+    candidate_limit: int = 100,
+    rerank: bool = True,
 ) -> list[dict]:
     normalized_query = query.strip()
     ensure_database()
@@ -153,7 +157,7 @@ def search_patents(
     terms = re.findall(r"\w+", query, flags=re.UNICODE)
     filters = []
     parameters: list[object] = []
-    if terms:
+    if terms and rerank:
         filters.append("patent_search MATCH ?")
         parameters.append(" OR ".join(f'"{term}"' for term in terms))
     if hybrid:
@@ -172,40 +176,95 @@ def search_patents(
     if not filters:
         filters.append("1 = 1")
 
-    parameters.extend([limit, offset])
+    parameters.append(candidate_limit)
     with sqlite3.connect(DATABASE_PATH) as connection:
         rows = connection.execute(
             f"""
             SELECT
+                patent_search.rowid,
                 patents.title,
                 patents.doc_number,
                 patents.classification,
-                snippet(patent_search, 0, '<mark>', '</mark>', '...', 12)
-                    AS title_snippet,
-                snippet(patent_search, 2, '<mark>', '</mark>', '...', 30)
-                    AS claims_snippet,
-                snippet(patent_search, 3, '<mark>', '</mark>', '...', 30)
-                    AS description_snippet,
-                bm25(patent_search, 5.0, 3.0, 2.0, 1.0) AS relevance
+                bm25(patent_search, 5.0, 3.0, 2.0, 1.0) AS relevance,
+                substr(patents.abstract, 1, 2000),
+                substr(patents.claims, 1, 4000),
+                substr(patents.detailed_description, 1, 2000)
             FROM patent_search
             JOIN patents ON patents.id = patent_search.rowid
             WHERE {' AND '.join(filters)}
             ORDER BY relevance
             LIMIT ?
-            OFFSET ?
             """,
             parameters,
         ).fetchall()
 
-    return [
+    candidates = [
         {
-            "title": row[0],
-            "doc_number": row[1],
-            "classification": row[2],
-            "title_snippet": row[3],
-            "claims_snippet": row[4],
-            "description_snippet": row[5],
-            "relevance": row[6],
+            "id": row[0],
+            "title": row[1],
+            "doc_number": row[2],
+            "classification": row[3],
+            "bm25_relevance": row[4],
+            "abstract_text": row[5],
+            "claims_text": row[6],
+            "description_text": row[7],
+            "title_snippet": row[1],
+            "claims_snippet": "",
+            "description_snippet": "",
         }
         for row in rows
     ]
+
+    if terms and rerank:
+        pairs = [
+            (
+                normalized_query,
+                "Title: "
+                + candidate["title"]
+                + "\nAbstract: "
+                + candidate["abstract_text"]
+                + "\nClaims: "
+                + candidate["claims_text"][:4000]
+                + "\nDescription: "
+                + candidate["description_text"][:2000],
+            )
+            for candidate in candidates
+        ]
+        scores = _cross_encoder().predict(
+            pairs, batch_size=16, show_progress_bar=False
+        )
+        for candidate, score in zip(candidates, scores):
+            candidate["relevance"] = float(score)
+    else:
+        for candidate in candidates:
+            candidate["relevance"] = -float(candidate["bm25_relevance"])
+
+    candidates.sort(key=lambda candidate: candidate["relevance"], reverse=True)
+    page = candidates[offset : offset + limit]
+
+    if terms and page:
+        ids = [candidate["id"] for candidate in page]
+        placeholders = ",".join("?" for _ in ids)
+        with sqlite3.connect(DATABASE_PATH) as connection:
+            snippets = connection.execute(
+                f"""
+                SELECT
+                    rowid,
+                    snippet(patent_search, 0, '<mark>', '</mark>', '...', 12),
+                    snippet(patent_search, 2, '<mark>', '</mark>', '...', 30),
+                    snippet(patent_search, 3, '<mark>', '</mark>', '...', 30)
+                FROM patent_search
+                WHERE rowid IN ({placeholders})
+                """,
+                ids,
+            ).fetchall()
+        snippet_by_id = {row[0]: row[1:] for row in snippets}
+        for candidate in page:
+            title_snippet, claims_snippet, description_snippet = snippet_by_id[
+                candidate["id"]
+            ]
+            candidate["title_snippet"] = title_snippet
+            candidate["claims_snippet"] = claims_snippet
+            candidate["description_snippet"] = description_snippet
+
+    return page
